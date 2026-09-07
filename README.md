@@ -1,116 +1,174 @@
-# AAC — Adaptive Associative Computing
+# AAC — Adaptive Associative Computing (research prototype)
 
-**AAC** is a proposed neural sequence architecture built around one idea: not all information deserves the same computational treatment. Instead of forcing a single recurrent hidden state to remember everything, AAC splits memory by **timescale, persistence, and value**, and lets a learned controller decide — at every step — what's worth keeping, retrieving, or computing further.
+> **Status: early-stage research investigation, not a validated architecture.**
+> This repo documents an ongoing attempt to test whether AAC's core idea
+> holds up, using progressively more rigorous experiments. The honest
+> summary as of the most recent phase: **the central comparative claim
+> this project has been built around (AAC-diff vs. attention) is
+> currently unresolved**, because a methodology bug was found that
+> invalidates the fair-comparison basis of every number produced so far.
+> See "Current status" below before citing any number in this repo.
 
-> **AAC is a controlled neural dynamical system that continuously decides what to keep, what to retrieve, what to forget, and how much computation to spend, according to the predicted future value of information.**
+## What AAC is
 
----
-
-## Core principle
-
-Every decision in AAC — read, write, promote, merge, evict, reason — is governed by a single economic rule:
-
-```
-Expected future value of information  >  cost of storing or processing it
-```
-
-This turns the architecture into a resource-allocation problem rather than a fixed stack of layers.
-
-## State: three timescales
-
-AAC represents system state as a triple:
+AAC is a proposed neural sequence architecture organized around one
+idea: not all information deserves the same computational treatment.
+Instead of a single hidden state or full attention over the whole
+history, AAC splits memory into three timescales —
 
 ```
 Z_t = (S_t, T_t, P_t)
 ```
 
-| Component | Role | Timescale | Main cost |
-|---|---|---:|---:|
-| **S_t** — fast state | Continuous, compressed recent context (SSM / linear-attention style) | Very short | Continuous compute |
-| **T_t** — temporary trace | Buffer where uncertain information accumulates evidence before being trusted | Medium | Small recurrent cost |
-| **P_t** — persistent memory | Long-term associative store for information judged durably valuable | Long | Storage / retrieval |
+— a fast recurrent state (`S_t`), a temporary trace where uncertain
+information accumulates evidence (`T_t`), and a sparse, persistent
+associative memory for information judged durably valuable (`P_t`) —
+governed by a learned controller that decides, at every step, whether
+the expected value of remembering something exceeds the cost of storing
+or retrieving it. The full specification (with derivations) is in
+[`AAC.txt`](AAC.txt); [`AAC-corrections.md`](AAC-corrections.md)
+documents math errors found and fixed in the original spec (a circular
+dependency in the update order, a sign error in credit assignment,
+symbol collisions) before anything below was built.
 
-Information flows through increasing persistence: `token → S_t → T_t → P_t`, with promotion happening only when there's enough evidence of long-term value.
+**This repo is the process of actually testing that idea, not a
+finished implementation of it.** Read the phase documents in order —
+each one either confirms, narrows, or overturns something from the one
+before it, and the overturns are left visible rather than edited away.
 
-## How it works, end to end
+## Current status (read this before anything else)
 
-1. **Encode** the input into a structured event (entity/relation/value/time/confidence, plus a residual to avoid losing information to a narrow bottleneck).
-2. **Estimate utility** — a learned predictor scores how much the event would reduce future loss if retained.
-3. **Update the fast state** continuously (subquadratic, ~`O(N·d²)`, avoiding full quadratic attention).
-4. **Decide whether to retrieve** from persistent memory — via a hierarchical/clustered index (`O(d(log M + K))` instead of a brute-force `O(M·d)` scan), with the number of parallel queries scaling with uncertainty.
-5. **Update the temporary trace** with decay, so information that never accumulates evidence naturally fades.
-6. **Promote to persistent memory** only when justified — writes are sparse (a fraction `ρ ≪ 1` of inputs, not all of them).
-7. **Maintain memory as evidence, not fact** — items carry confidence and provenance, so contradictory information can coexist as competing hypotheses (e.g. `P(B|A)=0.6` vs `P(C|A)=0.4`) rather than being silently overwritten.
-8. **Reinforce, merge, and evict** — memories gain confidence when reused, compatible memories merge (confidence-weighted average), contradictory ones stay separate, and low-confidence memories are removed.
-9. **Reason adaptively** — the number of extra reasoning steps scales with input difficulty/uncertainty rather than being fixed.
+The investigation has three phases, run against progressively harder
+tests:
 
-All of this is driven by one policy:
+| Phase | What it tested | Verdict |
+|---|---|---|
+| [`aac_prototype/`](aac_prototype/) (non-differentiable) | Do the discrete mechanisms (write/promote/evict/merge/hierarchical routing) behave as specified? | **Yes.** All mechanisms work and are stress-tested (`mechanism_checks.py`, `scaling_sweep.py`) — but writes/reads were hand-fed via pre-aligned identity embeddings and trained with proxy supervision, not learned end-to-end. |
+| [`PHASE2_RESULTS.md`](PHASE2_RESULTS.md) | A *differentiable* relaxation of the memory (continuous gated fast-weight matrix, real backprop, no privileged embeddings) vs. an RNN baseline and a softmax-attention baseline, on a standard induction-head recall task | AAC-diff appeared to lose badly to attention (1.4% vs. 57.2%). **This comparison is now known to be confounded — see Phase 3.** |
+| [`DELTA_RULE_RESULTS.md`](DELTA_RULE_RESULTS.md) | Does a DeltaNet-style write rule fix it? | No measurable effect at the time — but this was also run under the same confound found in Phase 3. |
+| [`PHASE3_GATE_RESULTS.md`](PHASE3_GATE_RESULTS.md) | Systematically isolating *why* AAC-diff was failing | Found and fixed two real bugs (a testing artifact that manufactured a false "dual bottleneck," and a non-deterministic autodiff tie-break) — then found that **every prior experiment, including Phase 2's headline comparison, was run under a constant unscheduled learning rate that alone was capping accuracy at chance-to-single-digits**. Fixing only the schedule, with zero architecture changes, recovered 45–65% accuracy from a config that had been stuck at 6.3%. The attention baseline has never been given the same optimizer treatment. **No number in this repo currently supports a claim that AAC-diff is better or worse than attention.** |
 
-```
-a_t = argmax_a [ E(ΔL | a) − λ_C·C(a) − λ_M·M(a) ]
-```
+If you're looking for "does AAC work," the honest answer right now is:
+**unknown, pending a fair re-run.** The next required step (not yet
+done) is re-testing every config — including the attention baseline —
+under a properly explored learning-rate schedule, to confirmed
+convergence, before any comparative claim is meaningful again.
 
-i.e., take an action only when its expected reduction in loss outweighs its compute/memory/retrieval cost.
-
-## Why: the problem with full attention
-
-Full attention gives broad access to a sequence but at growing interaction cost. AAC instead routes information by its likely lifetime:
-
-- Recent context → recurrent state
-- Potentially durable information → persistent memory
-- Ambiguous cases → extra (adaptive) computation
-
-This means long-range retrieval doesn't require reconstructing the whole history at every step.
-
-## Complexity target
+## Repo structure
 
 ```
-O(N·d²)                          fast recurrent pathway
-+ O(ρ·N·d·(log M + K))           sparse, hierarchically-routed memory ops
-+ O(d · Σ_t n_t)                 adaptive reasoning
+AAC.txt                    original architecture specification
+AAC-corrections.md         math errors found in the spec, and their fixes
+
+aac_prototype/             Phase 1: non-differentiable NumPy prototype
+  aac/                     fast_state, memory, trace, controller, mlp, model
+  train.py                 trains on a hand-aligned synthetic recall task
+  mechanism_checks.py      isolated routing/merge/eviction stress tests
+  scaling_sweep.py         routing latency scaling, generalization sweep
+
+  aac/autodiff.py          hand-rolled, gradient-checked reverse-mode autodiff
+  aac/models_diff.py       RNN baseline, attention baseline, differentiable
+                           AAC-diff (all matched-budget, all trained end-to-end)
+  task_mqar.py              harder shared-vocabulary induction-head recall task
+  train_compare.py          Phase 2 training/comparison driver
+  test_autodiff.py          numerical gradient checks for every autodiff op
+
+PHASE2_RESULTS.md           Phase 2 write-up
+DELTA_RULE_RESULTS.md       delta-rule variant results
+PHASE3_GATE_RESULTS.md      Phase 3 write-up (supersedes Phase 2's headline claim)
 ```
 
-under the operating assumptions `ρ ≪ 1`, `K ≪ M`, `n_t ≪ N` for most inputs — i.e., the expensive mechanisms are meant to be *selective*, not universal, keeping `|P_t| ≪ N`.
+No PyTorch/JAX is used anywhere in the differentiable work — there was
+no network access available to install one during development, so
+`aac/autodiff.py` is a small hand-written, gradient-checked reverse-mode
+autodiff engine. This is a real limitation worth knowing about if you're
+evaluating the engineering here: it's correct (verified to ~1e-10
+against finite differences, including the exact multi-step
+recurrence-plus-memory pattern the models use), but it's slower and less
+battle-tested than a real framework, and porting to one is a natural
+next step.
 
-## Relationship to existing ideas
+## Running it
 
-- **KDA / GDN / state-space models** — provide the foundation for AAC's fast recurrent state (`S_t`); AAC's contribution is *not* forcing that state to also carry durable information.
-- **Classical associative memory** — AAC externalizes a learned associative store (`P_t`), but adds learned policies for *when* to write, promote, query, merge, or forget it.
-- **Adaptive computation** — the controller acts as a compute gate, spending more reasoning steps on harder inputs, making AAC closer to a resource-aware dynamical system than a fixed-depth network.
+```bash
+pip install numpy   # the only dependency, anywhere in this repo
 
-## Full state-space summary
+# Phase 1: non-differentiable prototype
+cd aac_prototype
+python3 train.py
+python3 mechanism_checks.py
+python3 scaling_sweep.py
 
-```
-e_t   = E(x_t, S_{t-1})                          # event formation
-q_t   = Q(e_t, S_t, T_t)                          # query construction
-a_t   = π(S_t, T_t, P_t)                          # controller policy
-m_t   = Read(P_t, q_t)                            # associative retrieval
-S_t   = F_S(S_{t-1}, x_t, a_t)                    # fast state update
-T_t   = λ_t·T_{t-1} + F_T(x_t, S_t)               # temporary trace update
-h_t   = F_H(x_t, S_t, T_t, m_t)                   # output
-ΔP_t  = Validate(T_t, a_t)                        # candidate persistent write
-P_t   = Merge(Evict(P_{t-1} + ΔP_t))              # persistent memory update
-```
-
-subject to the overall objective:
-
-```
-min_θ  E[ L_task + λ_C·C(a_t) + λ_M·M(P_t) + λ_R·R(q_t, P_t) + λ_W·W(a_t) ]
+# Phase 2/3: differentiable comparison
+python3 test_autodiff.py     # verify the autodiff engine before trusting anything else
+python3 train_compare.py     # RNN vs. attention vs. AAC-diff, matched budget
 ```
 
-## One-line definition
+## What's genuinely established so far
 
-```
-AAC = multi-timescale recurrent state
-    + learned information valuation
-    + sparse associative memory
-    + hierarchical retrieval
-    + adaptive computation
-    + memory competition
-```
+- The discrete write/promote/evict/merge/hierarchical-routing mechanisms
+  work as specified, in isolation, when given hand-aligned inputs
+  (Phase 1).
+- A differentiable relaxation of the memory is trainable end-to-end via
+  real backprop (verified via gradient checking, not assumed).
+- The read/retrieval pathway is *not* independently broken — it learns
+  fine given correct writes (Phase 3, Finding 1, correcting an earlier
+  Phase 2 misdiagnosis).
+- A fixed, fast exponential decay silently caps the usable memory
+  horizon regardless of write quality — this is a real, fixable
+  bottleneck, confirmed stable across every later check (Phase 3,
+  Finding 2).
+- Optimizer hygiene (learning-rate scheduling) has a larger effect on
+  measured accuracy than every architectural variable tested in this
+  repo so far, combined. This was not anticipated going in, and is
+  arguably the most important finding to date — not because it's about
+  AAC specifically, but because it invalidates the basis for comparing
+  anything else until it's controlled for.
 
-Goal: long-context capability + persistent memory + adaptive reasoning, without every token paying the full cost of global attention, dense memory retrieval, or deep computation.
+## What's genuinely still open
 
----
+- Whether AAC-diff can match or beat attention once both are trained
+  under equivalent, converged optimization — **not yet tested**.
+- Whether gate supervision helps net of a fixed optimizer, and by how
+  much — current estimate (+5-9pp, 2 seeds, 2 unconverged schedules) is
+  a lower-confidence placeholder, not a settled number.
+- Everything about the discrete mechanisms (promotion, eviction, merge,
+  hierarchical routing, the controller's adaptive-reasoning budget) in
+  the *differentiable* setting — none of it has been integrated with the
+  trainable pathway yet. Phase 2/3 test a single fixed-size associative
+  matrix as a stand-in for the entire persistent-memory subsystem.
+- Any test beyond toy scale (currently `n_vocab=64`, hidden dim 32,
+  single layer, synthetic tasks only).
 
-*This README is a condensed summary of `AAC.txt`, a detailed mathematical specification of the AAC (AAC-1.1) architecture. It is a conceptual/theoretical design, not a benchmarked implementation — see the source document for full derivations and boxed equations.*
+## Contributing / next steps
+
+In priority order, per Phase 3's own conclusion:
+
+1. Re-run every existing configuration — RNN, attention, and AAC-diff,
+   aux and no-aux — under a properly explored learning-rate schedule
+   space, to confirmed convergence, with the *same* optimizer treatment
+   applied to all of them. Nothing else in this list matters until this
+   is done, because it's the thing that would make any other comparison
+   trustworthy again.
+2. Only after (1): investigate an unsupervised (non-oracle-label) proxy
+   for write importance, since the current gate-supervision results
+   depend on ground-truth labels not available in a real deployment.
+3. Only after (1) and (2): consider read-side sharpening (e.g. a
+   softmax/Hopfield-style retrieval instead of the current unnormalized
+   linear dot-product read) as a separate, isolated experiment — not
+   bundled with (2), so any effect can be attributed correctly.
+4. Longer-term: integrate the discrete mechanisms from the Phase 1
+   prototype (promotion, eviction, merge, hierarchical routing, adaptive
+   reasoning) into the differentiable pathway, once the foundation above
+   is stable enough to build on without re-litigating basic optimizer
+   hygiene every time a new number looks surprising.
+
+If you're adding a new experiment: gradient-check any new autodiff op
+before trusting results built on it, run more than one seed before
+reporting an accuracy number, and check for convergence before treating
+any number as final. Every phase in this repo that skipped one of those
+three things had to walk something back later.
+
+## License
+
+*Apache 2.0*
